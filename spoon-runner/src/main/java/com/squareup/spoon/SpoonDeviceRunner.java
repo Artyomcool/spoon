@@ -229,11 +229,17 @@ public final class SpoonDeviceRunner {
       listeners.addAll(testRunListeners);
     }
 
+    for (ITestRunListener listener : listeners) {
+      if (listener instanceof SpoonListener) {
+        ((SpoonListener) listener).testListReceived(activeTests, ignoredTests);
+      }
+    }
+
     result.startTests();
     if (singleInstrumentationCall) {
       try {
         logDebug(debug, "Running all tests in a single instrumentation call on [%s]", serial);
-        RemoteAndroidTestRunner runner = createConfiguredRunner(testPackage, testRunner, device);
+        RemoteAndroidTestRunner runner = createConfiguredRunner(testPackage, testRunner, device, null);
         runner.run(listeners);
       } catch (Exception e) {
         result.addException(e);
@@ -243,16 +249,46 @@ public final class SpoonDeviceRunner {
       multiRunListener.multiRunStarted(recorder.runName(), recorder.testCount());
 
       for (TestIdentifier test : activeTests) {
-        try {
-          logDebug(debug, "Running %s on [%s]", test, serial);
-          RemoteAndroidTestRunner runner = createConfiguredRunner(testPackage, testRunner, device);
-          runner.removeInstrumentationArg("package");
-          runner.removeInstrumentationArg("class");
-          runner.setMethodName(test.getClassName(), test.getTestName());
-          runner.run(listeners);
-        } catch (Exception e) {
-          result.addException(e);
-        }
+        String[] restartParam = new String[1];
+        SpoonListener listener = new SpoonListener() {
+          @Override
+          public void testStarted(TestIdentifier test) {
+            if (restartParam[0] == null) {
+              multiRunListener.testStarted(test);
+            }
+          }
+
+          @Override
+          public void testFailed(TestIdentifier test, String trace) {
+            multiRunListener.testFailed(test, trace);
+          }
+
+          @Override
+          public void testAssumptionFailure(TestIdentifier test, String trace) {
+            multiRunListener.testAssumptionFailure(test, trace);
+          }
+
+          @Override
+          public void testEnded(TestIdentifier test, Map<String, String> testMetrics) {
+            restartParam[0] = testMetrics.get("restartParam");
+          }
+        };
+        do {
+          try {
+            logDebug(debug, "Running %s on [%s]", test, serial);
+            RemoteAndroidTestRunner runner = createConfiguredRunner(testPackage, testRunner, device, restartParam[0]);
+            runner.removeInstrumentationArg("package");
+            runner.removeInstrumentationArg("class");
+            if (restartParam[0] != null) {
+              runner.addInstrumentationArg("restartParam", restartParam[0]);
+            }
+            runner.setMethodName(test.getClassName(), test.getTestName());
+            runner.run(Collections.singletonList(listener));
+          } catch (Exception e) {
+            result.addException(e);
+          }
+        } while (restartParam[0] != null);
+        multiRunListener.testEnded(test, emptyMap());
       }
       for (TestIdentifier ignoredTest : ignoredTests) {
         multiRunListener.testStarted(ignoredTest);
@@ -263,6 +299,12 @@ public final class SpoonDeviceRunner {
       multiRunListener.multiRunEnded();
     }
     result.endTests();
+
+    for (ITestRunListener listener : listeners) {
+      if (listener instanceof SpoonListener) {
+        ((SpoonListener) listener).testListFinished();
+      }
+    }
 
     mapLogsToTests(deviceLogger, result);
 
@@ -303,7 +345,7 @@ public final class SpoonDeviceRunner {
 
     LogRecordingTestRunListener recorder = new LogRecordingTestRunListener();
     logDebug(debug, "Querying a list of tests on [%s]", serial);
-    RemoteAndroidTestRunner runner = createConfiguredRunner(testPackage, testRunner, device);
+    RemoteAndroidTestRunner runner = createConfiguredRunner(testPackage, testRunner, device, null);
     runner.addBooleanArg("log", true);
     runner.run(recorder);
     return recorder;
@@ -314,11 +356,11 @@ public final class SpoonDeviceRunner {
    * This method adds sharding, class name, method name, test size and coverage, if available.
    */
   private RemoteAndroidTestRunner createConfiguredRunner(String testPackage, String testRunner,
-      IDevice device) throws Exception {
+      IDevice device, String restartParam) throws Exception {
 
     RemoteAndroidTestRunner runner = new SpoonAndroidTestRunner(
             instrumentationInfo.getApplicationPackage(), testPackage, testRunner, device,
-            clearAppDataBeforeEachTest, debug);
+            isClearData(restartParam), debug);
     runner.setMaxTimeToOutputResponse(adbTimeout.toMillis(), TimeUnit.MILLISECONDS);
 
     for (Map.Entry<String, String> entry : instrumentationArgs.entrySet()) {
@@ -352,6 +394,22 @@ public final class SpoonDeviceRunner {
     }
 
     return runner;
+  }
+
+  private boolean isClearData(String restartParam) {
+    if (restartParam == null) {
+      return clearAppDataBeforeEachTest;
+    }
+    String[] parts = restartParam.split("_", 2);
+    logInfo("isClearData " + restartParam + " " + parts[0]);
+    switch (parts[0]) {
+      case "justRestart":
+        return false;
+      case "cleanRestart":
+        return true;
+      default:
+        return clearAppDataBeforeEachTest;
+    }
   }
 
   private void addCodeCoverageInstrumentationArgs(RemoteAndroidTestRunner runner, IDevice device)
